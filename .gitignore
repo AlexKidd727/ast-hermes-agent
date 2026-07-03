@@ -79,6 +79,3 @@ website/static/api/skills-index.json
 # Cursor IDE
 cursor/
 
-# Local scripts
-start_agent.sh
-start_gateway.sh
