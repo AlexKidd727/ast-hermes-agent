@@ -424,7 +424,13 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         model_short = model_short[:25] + "..."
     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
     left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
-    left_lines.append(f"[dim {dim}]{cwd}[/]")
+    from hermes_constants import display_hermes_home
+    _hermes_home_display = display_hermes_home()
+    if _hermes_home_display:
+        left_lines.append(f"[dim {dim}]Project: {cwd}[/]")
+        left_lines.append(f"[dim {dim}]Config:  {_hermes_home_display}[/]")
+    else:
+        left_lines.append(f"[dim {dim}]{cwd}[/]")
     if session_id:
         left_lines.append(f"[dim {session_color}]Session: {session_id}[/]")
     left_content = "\n".join(left_lines)

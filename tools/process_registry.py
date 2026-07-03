@@ -41,7 +41,11 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _get_shell_info,
+    _sanitize_subprocess_env,
+)
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -402,12 +406,19 @@ class ProcessRegistry:
     @staticmethod
     def _is_host_pid_alive(pid: Optional[int]) -> bool:
         """Best-effort liveness check for host-visible PIDs."""
-        if not pid:
-            return False
+        try:
+            from gateway.status import is_pid_alive
+
+            return is_pid_alive(pid)
+        except Exception:
+            if not pid:
+                return False
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except PermissionError:
+            return True
+        except (ProcessLookupError, OSError, SystemError):
             return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
@@ -456,6 +467,27 @@ class ProcessRegistry:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
 
+    def _build_shell_args(self, command: str) -> list[str]:
+        """Build subprocess args for the active shell.
+
+        Returns a list of argv entries for subprocess.Popen.
+        """
+        shell_path, shell_type = _get_shell_info()
+        if shell_type == "bash":
+            return [shell_path, "-lic", f"set +m; {command}"]
+        elif shell_type == "cmd":
+            return [shell_path, "/V:ON", "/c", command]
+        elif shell_type == "powershell":
+            return [shell_path, "-NoProfile", "-Command", command]
+        else:
+            return [shell_path, "-lic", f"set +m; {command}"]
+
+    @staticmethod
+    def _pty_supported() -> bool:
+        """PTY mode is only supported with bash (winpty expects bash semantics)."""
+        _, shell_type = _get_shell_info()
+        return shell_type == "bash"
+
     def spawn_local(
         self,
         command: str,
@@ -474,6 +506,7 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+                     Only supported with bash shell.
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
@@ -485,58 +518,64 @@ class ProcessRegistry:
         )
 
         if use_pty:
-            # Try PTY mode for interactive CLI tools
-            try:
-                if _IS_WINDOWS:
-                    from winpty import PtyProcess as _PtyProcessCls
-                else:
-                    from ptyprocess import PtyProcess as _PtyProcessCls
-                user_shell = _find_shell()
-                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
-                pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
-                    cwd=session.cwd,
-                    env=pty_env,
-                    dimensions=(30, 120),
+            if not self._pty_supported():
+                logger.warning(
+                    "PTY mode requested but shell is not bash. "
+                    "Falling back to pipe mode."
                 )
-                session.pid = pty_proc.pid
-                # Store the pty handle on the session for read/write
-                session._pty = pty_proc
+            else:
+                # Try PTY mode for interactive CLI tools
+                try:
+                    if _IS_WINDOWS:
+                        from winpty import PtyProcess as _PtyProcessCls
+                    else:
+                        from ptyprocess import PtyProcess as _PtyProcessCls
+                    user_shell = _find_shell()
+                    pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                    pty_env["PYTHONUNBUFFERED"] = "1"
+                    pty_proc = _PtyProcessCls.spawn(
+                        [user_shell, "-lic", f"set +m; {command}"],
+                        cwd=session.cwd,
+                        env=pty_env,
+                        dimensions=(30, 120),
+                    )
+                    session.pid = pty_proc.pid
+                    # Store the pty handle on the session for read/write
+                    session._pty = pty_proc
 
-                # PTY reader thread
-                reader = threading.Thread(
-                    target=self._pty_reader_loop,
-                    args=(session,),
-                    daemon=True,
-                    name=f"proc-pty-reader-{session.id}",
-                )
-                session._reader_thread = reader
-                reader.start()
+                    # PTY reader thread
+                    reader = threading.Thread(
+                        target=self._pty_reader_loop,
+                        args=(session,),
+                        daemon=True,
+                        name=f"proc-pty-reader-{session.id}",
+                    )
+                    session._reader_thread = reader
+                    reader.start()
 
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
+                    with self._lock:
+                        self._prune_if_needed()
+                        self._running[session.id] = session
 
-                self._write_checkpoint()
-                return session
+                    self._write_checkpoint()
+                    return session
 
-            except ImportError:
-                logger.warning("ptyprocess not installed, falling back to pipe mode")
-            except Exception as e:
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                except ImportError:
+                    logger.warning("ptyprocess not installed, falling back to pipe mode")
+                except Exception as e:
+                    logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
-        # Use the user's login shell for consistency with LocalEnvironment --
+        # Use the user's shell for consistency with LocalEnvironment --
         # ensures rc files are sourced and user tools are available.
-        user_shell = _find_shell()
+        shell_args = self._build_shell_args(command)
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            shell_args,
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -776,7 +815,7 @@ class ProcessRegistry:
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
-        # _move_to_finished(), producing duplicate [SYSTEM: ...] messages.
+        # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""

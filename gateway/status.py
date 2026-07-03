@@ -31,6 +31,7 @@ _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
 _LOCKS_DIRNAME = "gateway-locks"
 _IS_WINDOWS = sys.platform == "win32"
+_ORIGINAL_OS_KILL = os.kill
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
@@ -95,6 +96,74 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     os.kill(pid, sig)
 
 
+def _open_windows_process(pid: int):
+    """Return a Windows process handle for liveness/start-time probes."""
+    if not _IS_WINDOWS or pid <= 0:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            wintypes.DWORD(pid),
+        )
+        return handle or None
+    except Exception:
+        return None
+
+
+def is_pid_alive(pid: Optional[int]) -> bool:
+    """Best-effort cross-platform process liveness check.
+
+    Windows/Python 3.13 can raise ``OSError(WinError 87)`` or even a
+    ``SystemError`` wrapper for ``os.kill(pid, 0)``.  Use WinAPI probing there
+    so stale gateway/process checkpoints do not crash startup.
+    """
+    if not pid or pid <= 0:
+        return False
+
+    # Preserve test seams and unusual embedders that monkeypatch os.kill.
+    if os.kill is not _ORIGINAL_OS_KILL:
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except (ProcessLookupError, OSError, SystemError):
+            return False
+
+    if _IS_WINDOWS:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = _open_windows_process(pid)
+            if not handle:
+                return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, SystemError):
+        return False
+
+
 def _scope_hash(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
@@ -105,6 +174,44 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
 
 def _get_process_start_time(pid: int) -> Optional[int]:
     """Return the kernel start time for a process when available."""
+    if _IS_WINDOWS:
+        handle = _open_windows_process(pid)
+        if not handle:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class FILETIME(ctypes.Structure):
+                _fields_ = [
+                    ("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            created = FILETIME()
+            exited = FILETIME()
+            kernel = FILETIME()
+            user = FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        except Exception:
+            return None
+        finally:
+            try:
+                import ctypes
+
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+            except Exception:
+                pass
+
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
@@ -214,7 +321,13 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
     if not pid_path.exists():
         return None
 
-    raw = pid_path.read_text().strip()
+    try:
+        # NOTE: If another process/user owns the lock/PID file, Windows can
+        # raise PermissionError here. Treat it as unreadable metadata rather
+        # than crashing gateway startup.
+        raw = pid_path.read_text().strip()
+    except (PermissionError, OSError):
+        return None
     if not raw:
         return None
 
@@ -234,7 +347,23 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
 
 
 def _read_gateway_lock_record(lock_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    return _read_pid_record(lock_path or _get_gateway_lock_path())
+    path = lock_path or _get_gateway_lock_path()
+    if _gateway_lock_handle is not None and path == _get_gateway_lock_path():
+        try:
+            _gateway_lock_handle.flush()
+            pos = _gateway_lock_handle.tell()
+            _gateway_lock_handle.seek(0)
+            raw = _gateway_lock_handle.read().strip()
+            _gateway_lock_handle.seek(pos)
+            if raw:
+                payload = json.loads(raw)
+                if isinstance(payload, int):
+                    return {"pid": payload}
+                if isinstance(payload, dict):
+                    return payload
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+    return _read_pid_record(path)
 
 
 def _pid_from_record(record: Optional[dict[str, Any]]) -> Optional[int]:
@@ -499,10 +628,11 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
         stale = existing_pid is None
         if not stale:
-            try:
-                os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError, OSError):
-                # Windows raises OSError with WinError 87 for invalid pid check
+            if not is_pid_alive(existing_pid):
+                # Windows/Python 3.13 can surface an invalid PID probe either as
+                # OSError(WinError 87) or as SystemError wrapping that OSError.
+                # In both cases the owner process is effectively gone for our
+                # stale-lock purposes, so treat the lock as stale.
                 stale = True
             else:
                 current_start = _get_process_start_time(existing_pid)
@@ -764,20 +894,7 @@ def get_running_pid(
         if pid is None:
             continue
 
-        try:
-            os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            # The process exists but belongs to another user/service scope.
-            # With the runtime lock still held, prefer keeping it visible
-            # rather than deleting the PID file as "stale".
-            if _record_looks_like_gateway(record):
-                return pid
-            continue
-        except OSError:
-            # Windows raises OSError with WinError 87 for an invalid pid
-            # (process is definitely gone). Treat as "process doesn't exist".
+        if not is_pid_alive(pid):
             continue
 
         recorded_start = record.get("start_time")

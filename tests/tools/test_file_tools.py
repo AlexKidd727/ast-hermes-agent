@@ -5,6 +5,7 @@ handling without requiring a running terminal environment.
 """
 
 import json
+import os
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -322,5 +323,22 @@ class TestSearchHints:
         assert "[Hint:" in raw
         assert "offset=100" in raw
 
+
+class TestCoerceWindowsForeignPath:
+    """_coerce_windows_foreign_path must run on Windows without NameError (uses ``re``)."""
+
+    def test_native_drive_path_passthrough_on_nt(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "nt")
+        from tools.file_tools import _coerce_windows_foreign_path
+
+        p = r"D:\Python\proj\AGENTS.md"
+        assert _coerce_windows_foreign_path(p) == p
+
+    def test_mnt_style_path_on_nt(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "nt")
+        from tools.file_tools import _coerce_windows_foreign_path
+
+        out = _coerce_windows_foreign_path("/mnt/c/Users/test/file.md")
+        assert out.lower().startswith("c:\\")
 
 

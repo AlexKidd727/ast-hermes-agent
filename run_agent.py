@@ -4515,7 +4515,7 @@ class AIAgent:
 
         # Environment hints (WSL, Termux, etc.) — tell the agent about the
         # execution environment so it can translate paths and adapt behavior.
-        _env_hints = build_environment_hints()
+        _env_hints = build_environment_hints(cwd=os.getenv("TERMINAL_CWD") or None)
         if _env_hints:
             prompt_parts.append(_env_hints)
 
@@ -8426,6 +8426,7 @@ class AIAgent:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            result=function_result,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -8801,6 +8802,7 @@ class AIAgent:
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        result=function_result,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")

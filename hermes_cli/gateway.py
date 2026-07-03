@@ -15,7 +15,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from gateway.status import terminate_pid
+from gateway.status import is_pid_alive, terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -216,14 +216,8 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
 
     deadline = _time.monotonic() + max(drain_timeout, 1.0)
     while _time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)  # signal 0 — probe liveness
-        except ProcessLookupError:
+        if not is_pid_alive(pid):
             return True
-        except PermissionError:
-            # Process still exists but we can't signal it.  Treat as alive
-            # so the caller falls back.
-            pass
         _time.sleep(0.5)
     # Drain didn't finish in time.
     return False
@@ -659,11 +653,9 @@ def stop_profile_gateway() -> bool:
     # Wait briefly for it to exit
     import time as _time
     for _ in range(20):
-        try:
-            os.kill(pid, 0)
-            _time.sleep(0.5)
-        except (ProcessLookupError, PermissionError):
+        if not is_pid_alive(pid):
             break
+        _time.sleep(0.5)
 
     if get_running_pid() is None:
         remove_pid_file()
@@ -1858,11 +1850,9 @@ def systemd_restart(system: bool = False):
         print(f"⏳ {scope_label} service draining active work...")
         deadline = time.time() + 90
         while time.time() < deadline:
-            try:
-                os.kill(pid, 0)
-                time.sleep(1)
-            except (ProcessLookupError, PermissionError):
+            if not is_pid_alive(pid):
                 break  # old process is gone
+            time.sleep(1)
         else:
             print(f"⚠ Old process (PID {pid}) still alive after 90s")
 
@@ -2724,6 +2714,24 @@ _PLATFORMS = [
              "help": "OpenID to deliver cron results and notifications to."},
         ],
     },
+    {
+        "key": "yuanbao",
+        "label": "Yuanbao",
+        "emoji": "💎",
+        "token_var": "YUANBAO_APP_ID",
+        "setup_instructions": [
+            "1. Download the Yuanbao app from https://yuanbao.tencent.com/",
+            "2. In the app, go to PAI → My Bot and create a new bot",
+            "3. After the bot is created, copy the App ID and App Secret",
+            "4. Enter them below and Hermes will connect automatically over WebSocket",
+        ],
+        "vars": [
+            {"name": "YUANBAO_APP_ID", "prompt": "App ID", "password": False,
+             "help": "The App ID from your Yuanbao IM Bot credentials."},
+            {"name": "YUANBAO_APP_SECRET", "prompt": "App Secret", "password": True,
+             "help": "The App Secret (used for HMAC signing) from your Yuanbao IM Bot."},
+        ],
+    },
 ]
 
 
@@ -3106,6 +3114,12 @@ def _setup_wecom():
 
     print()
     print_success("💬 WeCom configured!")
+
+
+def _setup_yuanbao():
+    """Configure Yuanbao via the standard platform setup."""
+    yuanbao_platform = next(p for p in _PLATFORMS if p["key"] == "yuanbao")
+    _setup_standard_platform(yuanbao_platform)
 
 
 def _is_service_installed() -> bool:

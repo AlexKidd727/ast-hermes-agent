@@ -15,6 +15,7 @@ import time
 import tempfile
 
 import pytest
+import requests
 import yaml
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -803,6 +804,30 @@ class TestFetchModelMetadata:
 
         result = fetch_model_metadata(force_refresh=True)
         assert result == {}
+
+    @patch("agent.model_metadata.requests.Session")
+    @patch("agent.model_metadata.requests.get")
+    def test_proxy_error_retries_without_env_proxy(self, mock_get, mock_session_cls):
+        """On ProxyError, retry OpenRouter metadata fetch with trust_env=False."""
+        self._reset_cache()
+        mock_get.side_effect = requests.exceptions.ProxyError("bad proxy")
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "data": [{"id": "test/model", "context_length": 99999, "name": "Test"}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_response
+        mock_session_cls.return_value.__enter__.return_value = mock_session
+
+        result = fetch_model_metadata(force_refresh=True)
+
+        assert "test/model" in result
+        assert mock_get.call_count == 1
+        assert mock_session.get.call_count == 1
+        assert mock_session.trust_env is False
 
 
 # =========================================================================

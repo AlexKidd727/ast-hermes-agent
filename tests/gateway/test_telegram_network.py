@@ -464,6 +464,77 @@ class TestAdapterFallbackIps:
         adapter = self._make_adapter(extra={"fallback_ips": ["149.154.167.220", "not-valid"]})
         assert adapter._fallback_ips() == ["149.154.167.220"]
 
+    @pytest.mark.asyncio
+    async def test_connect_prefers_fallback_transport_even_with_proxy(self, monkeypatch):
+        """Regression: proxy + fallback must use TelegramFallbackTransport together."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        import gateway.platforms.telegram as tmod
+
+        adapter = self._make_adapter(extra={"fallback_ips": ["149.154.167.220"]})
+
+        captured_httpx_kwargs = []
+
+        def fake_httpx_request(**kwargs):
+            captured_httpx_kwargs.append(kwargs)
+            return object()
+
+        class _FakeBuilder:
+            def __init__(self):
+                self._request = None
+                self._updates_request = None
+
+            def token(self, _):
+                return self
+
+            def request(self, req):
+                self._request = req
+                return self
+
+            def get_updates_request(self, req):
+                self._updates_request = req
+                return self
+
+            def build(self):
+                updater = SimpleNamespace(
+                    running=False,
+                    start_polling=AsyncMock(),
+                    stop=AsyncMock(),
+                )
+                app = SimpleNamespace(
+                    bot=SimpleNamespace(
+                        delete_webhook=AsyncMock(),
+                        set_my_commands=AsyncMock(),
+                    ),
+                    updater=updater,
+                    running=False,
+                    initialize=AsyncMock(),
+                    start=AsyncMock(),
+                    stop=AsyncMock(),
+                    shutdown=AsyncMock(),
+                    add_handler=lambda *_args, **_kwargs: None,
+                )
+                return app
+
+        monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *_a, **_k: True)
+        monkeypatch.setattr(adapter, "_release_platform_lock", lambda *_a, **_k: None)
+        monkeypatch.setattr(adapter, "_setup_dm_topics", AsyncMock())
+        monkeypatch.setattr(tmod, "HTTPXRequest", fake_httpx_request)
+        monkeypatch.setattr(tmod, "Application", SimpleNamespace(builder=lambda: _FakeBuilder()))
+        monkeypatch.setattr(tmod, "resolve_proxy_url", lambda *_a, **_k: "socks5://127.0.0.1:1080")
+        monkeypatch.setattr(tmod, "telegram_menu_commands", lambda max_commands=100: ([], 0), raising=False)
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "")
+
+        connected = await adapter.connect()
+        assert connected is True
+        assert len(captured_httpx_kwargs) == 2
+        assert all("proxy" not in kwargs for kwargs in captured_httpx_kwargs)
+        assert all("httpx_kwargs" in kwargs for kwargs in captured_httpx_kwargs)
+        assert all(
+            isinstance(kwargs["httpx_kwargs"].get("transport"), tmod.TelegramFallbackTransport)
+            for kwargs in captured_httpx_kwargs
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DoH auto-discovery

@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional
@@ -91,7 +92,9 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
     with _file_ops_lock:
         cached = _file_ops_cache.get(task_id)
     if cached is not None:
-        live_cwd = getattr(getattr(cached, "env", None), "cwd", None) or getattr(
+        live_cwd = getattr(getattr(cached, "env", None), "host_cwd", None) or getattr(
+            getattr(cached, "env", None), "cwd", None
+        ) or getattr(
             cached, "cwd", None
         )
         if live_cwd:
@@ -102,7 +105,9 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
 
         with _env_lock:
             env = _active_environments.get(task_id)
-            live_cwd = getattr(env, "cwd", None) if env is not None else None
+            live_cwd = (
+                getattr(env, "host_cwd", None) or getattr(env, "cwd", None)
+            ) if env is not None else None
         if live_cwd:
             return live_cwd
     except Exception:
@@ -113,6 +118,7 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
+    filepath = _coerce_windows_foreign_path(filepath)
     p = Path(filepath).expanduser()
     if not p.is_absolute():
         base = _get_live_tracking_cwd(task_id) or os.environ.get(
@@ -120,6 +126,52 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
         )
         p = Path(base) / p
     return p.resolve()
+
+
+def _coerce_windows_foreign_path(filepath: str) -> str:
+    """Normalize WSL/Git-Bash-style paths into native Windows paths."""
+    if os.name != "nt" or not filepath:
+        return filepath
+
+    text = str(filepath).strip().replace("\\", "/")
+
+    m = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", text)
+    if m:
+        drive = m.group(1).upper()
+        tail = (m.group(2) or "").replace("/", "\\")
+        return f"{drive}:\\{tail}" if tail else f"{drive}:\\"
+
+    m = re.match(r"^/cygdrive/([a-zA-Z])(?:/(.*))?$", text)
+    if m:
+        drive = m.group(1).upper()
+        tail = (m.group(2) or "").replace("/", "\\")
+        return f"{drive}:\\{tail}" if tail else f"{drive}:\\"
+
+    m = re.match(r"^/([a-zA-Z])(?:/(.*))?$", text)
+    if m and not text.startswith(("/testbed", "/workspace", "/app")):
+        drive = m.group(1).upper()
+        tail = (m.group(2) or "").replace("/", "\\")
+        return f"{drive}:\\{tail}" if tail else f"{drive}:\\"
+
+    return filepath
+
+
+def _get_windows_sandbox_path_hint(filepath: str, task_id: str = "default") -> str | None:
+    """Return a corrective hint for invented POSIX sandbox paths on Windows."""
+    if os.name != "nt" or not filepath:
+        return None
+
+    normalized = str(filepath).strip().replace("\\", "/")
+    sandbox_prefixes = ("/testbed", "/workspace", "/app", "/home")
+    if not any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in sandbox_prefixes):
+        return None
+
+    live_cwd = _get_live_tracking_cwd(task_id) or os.environ.get("TERMINAL_CWD") or os.getcwd()
+    return (
+        f"Path '{filepath}' looks like a Linux/container sandbox path, but this session is "
+        f"running on Windows local filesystem. Use a path relative to the current project or "
+        f"a real Windows path. Current working directory: {live_cwd}"
+    )
 
 
 def _is_blocked_device(filepath: str) -> bool:
@@ -387,7 +439,12 @@ def clear_file_ops_cache(task_id: str = None):
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        path = _coerce_windows_foreign_path(path)
         offset, limit = normalize_read_pagination(offset, limit)
+
+        sandbox_hint = _get_windows_sandbox_path_hint(path, task_id)
+        if sandbox_hint:
+            return json.dumps({"error": sandbox_hint}, ensure_ascii=False)
 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
@@ -650,6 +707,10 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    path = _coerce_windows_foreign_path(path)
+    sandbox_hint = _get_windows_sandbox_path_hint(path, task_id)
+    if sandbox_hint:
+        return tool_error(sandbox_hint)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -704,6 +765,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default") -> str:
     """Patch a file using replace mode or V4A patch format."""
+    if path:
+        path = _coerce_windows_foreign_path(path)
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -713,6 +776,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        sandbox_hint = _get_windows_sandbox_path_hint(_p, task_id)
+        if sandbox_hint:
+            return tool_error(sandbox_hint)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -802,7 +868,12 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
+        path = _coerce_windows_foreign_path(path)
         offset, limit = normalize_search_pagination(offset, limit)
+
+        sandbox_hint = _get_windows_sandbox_path_hint(path, task_id)
+        if sandbox_hint:
+            return json.dumps({"error": sandbox_hint}, ensure_ascii=False)
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
@@ -881,7 +952,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. NOTE: Cannot read images or binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. Paths are relative to the current project working directory unless absolute. Do not invent sandbox paths like /testbed or /workspace on local Windows sessions. NOTE: Cannot read images or binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -895,7 +966,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits.",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Paths are relative to the current project working directory unless absolute. Do not invent sandbox paths like /testbed or /workspace on local Windows sessions.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -925,7 +996,7 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time. Search paths are relative to the current project working directory unless absolute; do not invent sandbox roots like /testbed or /workspace on local Windows sessions.",
     "parameters": {
         "type": "object",
         "properties": {

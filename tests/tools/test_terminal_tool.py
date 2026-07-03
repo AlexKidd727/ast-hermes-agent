@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import os
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -103,3 +105,52 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_normalize_windows_paths_for_git_bash_quoted_and_bare(monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        "tools.environments.local._get_shell_info",
+        lambda: (r"C:\Program Files\Git\bin\bash.exe", "bash"),
+    )
+    quoted = (
+        'head -100 "D:\\Python\\LLM\\HermesAgent\\hermes-agent\\AGENTS.md"'
+    )
+    assert terminal_tool._normalize_windows_paths_for_git_bash(
+        quoted, "local"
+    ) == (
+        'head -100 "D:/Python/LLM/HermesAgent/hermes-agent/AGENTS.md"'
+    )
+    bare = "head -100 D:\\Python\\LLM\\HermesAgent\\hermes-agent\\AGENTS.md"
+    assert terminal_tool._normalize_windows_paths_for_git_bash(
+        bare, "local"
+    ) == "head -100 D:/Python/LLM/HermesAgent/hermes-agent/AGENTS.md"
+
+
+def test_normalize_windows_git_bash_rewrites_dir_slash_b(monkeypatch):
+    """cmd-style ``dir /b`` breaks under Git Bash (``/b`` becomes root path)."""
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        "tools.environments.local._get_shell_info",
+        lambda: (r"C:\Program Files\Git\bin\bash.exe", "bash"),
+    )
+    cmd = 'cd "D:/Python/repo" && dir /b'
+    assert terminal_tool._normalize_windows_git_bash_exploration_command(
+        cmd, "local"
+    ) == 'cd "D:/Python/repo" && ls -1'
+
+
+def test_normalize_windows_paths_for_git_bash_skips_cmd_and_non_local(monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        "tools.environments.local._get_shell_info",
+        lambda: (r"C:\Windows\System32\cmd.exe", "cmd"),
+    )
+    cmd = "head D:\\Python\\x.txt"
+    assert terminal_tool._normalize_windows_paths_for_git_bash(cmd, "local") == cmd
+
+    monkeypatch.setattr(
+        "tools.environments.local._get_shell_info",
+        lambda: (r"C:\Program Files\Git\bin\bash.exe", "bash"),
+    )
+    assert terminal_tool._normalize_windows_paths_for_git_bash(cmd, "docker") == cmd

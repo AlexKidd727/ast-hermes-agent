@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import platform
 import re
 import threading
 from collections import OrderedDict
@@ -139,6 +140,12 @@ DEFAULT_AGENT_IDENTITY = (
     "You communicate clearly, admit uncertainty when appropriate, and prioritize "
     "being genuinely useful over being verbose unless otherwise directed below. "
     "Be targeted and efficient in your exploration and investigations."
+)
+
+HERMES_AGENT_HELP_GUIDANCE = (
+    "If the user asks about configuring, setting up, or using Hermes Agent "
+    "itself, load the `hermes-agent` skill with skill_view(name='hermes-agent') "
+    "before answering. Docs: https://hermes-agent.nousresearch.com/docs"
 )
 
 MEMORY_GUIDANCE = (
@@ -279,6 +286,19 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     "to prevent CLI tools from hanging on prompts.\n"
     "- **Keep going:** Work autonomously until the task is fully resolved. "
     "Don't stop with a plan — execute it.\n"
+)
+
+WINDOWS_PATH_GUIDANCE = (
+    "# Windows path guidance\n"
+    "- Distinguish Hermes config/home paths from the active project checkout.\n"
+    "- `HERMES_HOME` (for config, logs, sessions, skills) lives under paths like "
+    "`C:\\Users\\<user>\\.hermes\\...`.\n"
+    "- The current project/workspace may be a completely different path such as "
+    "`D:\\...\\project`.\n"
+    "- Do NOT assume the project lives under `~/.hermes/repos/...`, `/workspace/...`, "
+    "`/testbed/...`, `/mnt/c/...`, or `/home/hermes/...` unless a tool result explicitly shows that path.\n"
+    "- For project files, prefer relative paths or the live working directory from tools. "
+    "Use `.hermes` paths only when the task is specifically about Hermes config/state."
 )
 
 # Model name substrings that should use the 'developer' role instead of
@@ -422,6 +442,29 @@ PLATFORM_HINTS = {
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
     ),
+    "yuanbao": (
+        "You are on Yuanbao (腾讯元宝), a Chinese AI assistant platform. "
+        "Markdown formatting is supported (code blocks, tables, bold/italic). "
+        "You CAN send media files natively — to deliver a file to the user, include "
+        "MEDIA:/absolute/path/to/file in your response. The file will be sent as a native "
+        "Yuanbao attachment: images (.jpg, .png, .webp, .gif) are sent as photos, "
+        "and other files (.pdf, .docx, .txt, .zip, etc.) arrive as downloadable documents "
+        "(max 50 MB). You can also include image URLs in markdown format ![alt](url) and "
+        "they will be downloaded and sent as native photos. "
+        "Do NOT tell the user you lack file-sending capability — use MEDIA: syntax "
+        "whenever a file delivery is appropriate.\n\n"
+        "Stickers (贴纸 / 表情包 / TIM face): Yuanbao has a built-in sticker catalogue. "
+        "When the user sends a sticker (you see '[emoji: 名称]' in their message) or asks "
+        "you to send/reply-with a 贴纸/表情/表情包, you MUST use the sticker tools:\n"
+        "  1. Call yb_search_sticker with a Chinese keyword (e.g. '666', '比心', '吃瓜', "
+        "     '捂脸', '合十') to discover matching sticker_ids.\n"
+        "  2. Call yb_send_sticker with the chosen sticker_id or name — this sends a real "
+        "     TIMFaceElem that renders as a native sticker in the chat.\n"
+        "DO NOT draw sticker-like PNGs with execute_code/Pillow/matplotlib and then send "
+        "them via MEDIA: or send_image_file. That produces a fake low-quality 'sticker' "
+        "image and is the WRONG path. Bare Unicode emoji in text is also not a substitute "
+        "— when a sticker is the right response, use yb_send_sticker."
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -442,7 +485,7 @@ WSL_ENVIRONMENT_HINT = (
 )
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(cwd: str | None = None) -> str:
     """Return environment-specific guidance for the system prompt.
 
     Detects WSL, and can be extended for Termux, Docker, etc.
@@ -451,6 +494,17 @@ def build_environment_hints() -> str:
     hints: list[str] = []
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
+    elif platform.system() == "Windows":
+        hints.append(WINDOWS_PATH_GUIDANCE)
+    if cwd:
+        config = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        hints.append(
+            f"# Working directories\n"
+            f"- Project/workspace: {cwd}\n"
+            f"- Hermes config/logs: {config}\n"
+            f"Keep these separate. Project files belong to the project directory; "
+            f"Hermes config, sessions, skills, and logs belong to the Hermes directory."
+        )
     return "\n\n".join(hints)
 
 
@@ -825,6 +879,11 @@ def build_skills_system_prompt(
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
@@ -1081,4 +1140,5 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
 
     if not sections:
         return ""
-    return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+    header = f"# Project Context\n\nWorking directory: {cwd_path}\n\nThe following project context files have been loaded and should be followed:\n\n"
+    return header + "\n".join(sections)

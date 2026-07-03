@@ -816,6 +816,17 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         if isinstance(data, dict):
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
+                detail = (
+                    data.get("failure_summary")
+                    or data.get("error")
+                    or data.get("exit_code_meaning")
+                    or ""
+                )
+                detail = " ".join(str(detail).split()).strip()
+                if detail:
+                    if len(detail) > 90:
+                        detail = detail[:87] + "..."
+                    return True, f" [exit {exit_code}: {detail}]"
                 return True, f" [exit {exit_code}]"
         return False, ""
 
@@ -832,6 +843,33 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         return True, " [error]"
 
     return False, ""
+
+
+def _terminal_success_preview(result: str | None, max_len: int = 48) -> str:
+    """One-line preview of successful terminal JSON output for CLI scrollback."""
+    if not result:
+        return ""
+    data = safe_json_loads(result)
+    if not isinstance(data, dict):
+        return ""
+    exit_code = data.get("exit_code")
+    if exit_code is not None and exit_code != 0:
+        return ""
+    output = (data.get("output") or "").strip()
+    if not output:
+        return ""
+    first = ""
+    for ln in output.splitlines():
+        t = ln.strip()
+        if t:
+            first = t
+            break
+    if not first:
+        return ""
+    first = " ".join(first.split())
+    if len(first) > max_len:
+        first = first[: max_len - 3] + "..."
+    return f" -> {first}"
 
 
 def get_cute_tool_message(
@@ -883,7 +921,10 @@ def get_cute_tool_message(
         domain = url.replace("https://", "").replace("http://", "").split("/")[0]
         return _wrap(f"┊ 🕸️  crawl     {_trunc(domain, 35)}  {dur}")
     if tool_name == "terminal":
-        return _wrap(f"┊ 💻 $         {_trunc(args.get('command', ''), 42)}  {dur}")
+        base = f"┊ 💻 $         {_trunc(args.get('command', ''), 42)}  {dur}"
+        if not is_failure:
+            base += _terminal_success_preview(result)
+        return _wrap(base)
     if tool_name == "process":
         action = args.get("action", "?")
         sid = args.get("session_id", "")[:12]

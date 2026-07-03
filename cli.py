@@ -2104,6 +2104,7 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+        self._resize_redraw_timer: Optional[threading.Timer] = None
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -2111,6 +2112,43 @@ class HermesCLI:
         if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
             self._last_invalidate = now
             self._app.invalidate()
+
+    def _schedule_resize_redraw(self, delay: float = 0.12) -> None:
+        """Debounce resize storms into one corrective repaint.
+
+        On Windows we want one extra repaint after the host finishes its
+        internal reflow, but a full erase/reset is too aggressive here and
+        can collapse the visible transcript down to the status/input chrome.
+        So we only invalidate prompt_toolkit's cached screen and ask for one
+        fresh paint.
+        """
+        try:
+            existing = getattr(self, "_resize_redraw_timer", None)
+            if existing is not None:
+                existing.cancel()
+        except Exception:
+            pass
+
+        def _run() -> None:
+            try:
+                app = getattr(self, "_app", None)
+                if not app:
+                    return
+                try:
+                    app.renderer._last_screen = None
+                except Exception:
+                    pass
+                try:
+                    app.invalidate()
+                except Exception:
+                    pass
+            finally:
+                self._resize_redraw_timer = None
+
+        timer = threading.Timer(delay, _run)
+        timer.daemon = True
+        self._resize_redraw_timer = timer
+        timer.start()
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -2283,6 +2321,15 @@ class HermesCLI:
             return get_app().output.get_size().columns
         except Exception:
             return shutil.get_terminal_size(default).columns
+
+    @staticmethod
+    def _get_tui_terminal_rows(default: tuple[int, int] = (80, 24)) -> int:
+        """Return the live prompt_toolkit row count, falling back to ``shutil``."""
+        try:
+            from prompt_toolkit.application import get_app
+            return get_app().output.get_size().rows
+        except Exception:
+            return shutil.get_terminal_size(default).lines
 
     def _use_minimal_tui_chrome(self, width: Optional[int] = None) -> bool:
         """Hide low-value chrome on narrow/mobile terminals to preserve rows."""
@@ -4258,7 +4305,8 @@ class HermesCLI:
             "Hermes CLI Status",
             "",
             f"Session ID: {self.session_id}",
-            f"Path: {display_hermes_home()}",
+            f"Project: {os.getenv('TERMINAL_CWD', os.getcwd())}",
+            f"Config:  {display_hermes_home()}",
         ]
         if title:
             lines.append(f"Title: {title}")
@@ -7404,10 +7452,17 @@ class HermesCLI:
                     return
                 self._last_scrollback_tool = function_name
                 try:
-                    from agent.display import get_cute_tool_message
-                    line = get_cute_tool_message(function_name, stored_args, duration)
+                    from agent.display import get_cute_tool_message, _detect_tool_failure
+                    tool_result = kwargs.get("result")
+                    line = get_cute_tool_message(
+                        function_name, stored_args, duration, result=tool_result
+                    )
+                    # When the tool result already carries a failure suffix (e.g.
+                    # terminal "[exit 2: ...]"), do not append a generic [error].
                     if is_error:
-                        line = f"{line} [error]"
+                        _, fail_suffix = _detect_tool_failure(function_name, tool_result)
+                        if not fail_suffix:
+                            line = f"{line} [error]"
                     _cprint(f"  {line}")
                 except Exception:
                     pass
@@ -8103,7 +8158,7 @@ class HermesCLI:
             return []
 
         def _panel_box_width(title_text: str, content_lines: list[str], min_width: int = 46, max_width: int = 76) -> int:
-            term_cols = shutil.get_terminal_size((100, 20)).columns
+            term_cols = self._get_tui_terminal_width(default=(100, 20))
             longest = max([len(title_text)] + [len(line) for line in content_lines] + [min_width - 4])
             inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
             return inner + 2
@@ -8188,7 +8243,7 @@ class HermesCLI:
         # spinner/tool-progress line, status bar, input area, separators, and
         # prompt symbol. Measured at ~6 rows during live PTY approval prompts;
         # budget 6 so we don't overestimate the panel's room.
-        term_rows = shutil.get_terminal_size((100, 24)).lines
+        term_rows = self._get_tui_terminal_rows(default=(100, 24))
         chrome_full = 5
         chrome_tight = 3
         reserved_below = 6
@@ -9985,7 +10040,7 @@ class HermesCLI:
 
         def _panel_box_width(title: str, content_lines: list[str], min_width: int = 46, max_width: int = 76) -> int:
             """Choose a stable panel width wide enough for the title and content."""
-            term_cols = shutil.get_terminal_size((100, 20)).columns
+            term_cols = cli_ref._get_tui_terminal_width(default=(100, 20))
             longest = max([len(title)] + [len(line) for line in content_lines] + [min_width - 4])
             inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
             return inner + 2  # account for the single leading/trailing spaces inside borders
@@ -10105,7 +10160,7 @@ class HermesCLI:
             #
             # reserved_below matches the approval-panel budget (~6 rows for
             # spinner/tool-progress + status + input + separators + prompt).
-            term_rows = shutil.get_terminal_size((100, 24)).lines
+            term_rows = cli_ref._get_tui_terminal_rows(default=(100, 24))
             chrome_full = 5
             chrome_tight = 2
             reserved_below = 6
@@ -10299,7 +10354,7 @@ class HermesCLI:
                 from prompt_toolkit.application import get_app
                 term_rows = get_app().output.get_size().rows
             except Exception:
-                term_rows = shutil.get_terminal_size((100, 24)).lines
+                term_rows = cli_ref._get_tui_terminal_rows(default=(100, 24))
             scroll_offset, visible = HermesCLI._compute_model_picker_viewport(
                 selected, state.get("_scroll_offset", 0), len(choices), term_rows,
             )
@@ -10353,6 +10408,7 @@ class HermesCLI:
             badges = _format_image_attachment_badges(
                 cli_ref._attached_images,
                 cli_ref._image_counter,
+                width=cli_ref._get_tui_terminal_width(),
             )
             return [("class:image-badge", f" {badges} ")]
 
@@ -10491,11 +10547,40 @@ class HermesCLI:
         #
         # Fix: before the standard erase, inflate _cursor_pos.y so the
         # cursor moves up far enough to cover the reflowed ghost content.
+        # On Windows, terminal reflow and VT cursor tracking work differently
+        # (Windows Terminal / conhost use a buffer-based system), so the
+        # cursor trick is unreliable.  Instead we clear the full screen
+        # unconditionally and force a full redraw (#4645).
         _original_on_resize = app._on_resize
 
         def _resize_clear_ghosts():
             from prompt_toolkit.data_structures import Point as _Pt
             renderer = app.renderer
+
+            if sys.platform == 'win32':
+                # ── Windows: full screen clear + redraw ──
+                # Windows Terminal and conhost handle line reflow via their
+                # own buffer system, not VT cursor positioning.  The renderer's
+                # _cursor_pos can drift after resize, making the ghost-clearing
+                # cursor-offset trick (below) unreliable.  Instead we:
+                #   1. Discard last screen to force a full (non-diff) redraw
+                #   2. Unconditionally clear the display via VT escape seqs
+                #   3. Fall through to the standard handler (erase + redraw)
+                try:
+                    renderer._last_screen = None
+                    renderer.output.erase_screen()
+                    renderer.output.cursor_goto(0, 0)
+                    renderer.output.flush()
+                except Exception:
+                    pass
+                _original_on_resize()
+                # Resize often arrives as a burst while the host is still
+                # reflowing wrapped rows. One delayed full repaint cleans up
+                # any leftover duplicate status/input lines after the burst.
+                self._schedule_resize_redraw()
+                return
+
+            # ── Unix: VT cursor trick for ghost clearing ──
             try:
                 old_size = renderer._last_size
                 new_size = renderer.output.get_size()
@@ -10527,10 +10612,40 @@ class HermesCLI:
 
         def spinner_loop():
             last_idle_refresh = 0.0
+            # On Windows, terminal resize detection via prompt_toolkit's
+            # _poll_output_size can be unreliable (get_terminal_size() may
+            # return stale sizes after console buffer resize).  We add an
+            # extra polling layer here with shutil.get_terminal_size()
+            # which uses the Windows Console API directly.
+            if sys.platform == 'win32':
+                try:
+                    _win_last_size = shutil.get_terminal_size()
+                except Exception:
+                    _win_last_size = None
+            else:
+                _win_last_size = None
+            _win_resize_check_interval = 10  # every 10th iteration (~2s)
+            _win_resize_counter = 0
             while not self._should_exit:
                 if not self._app:
                     time.sleep(0.1)
                     continue
+                # ── Windows: extra terminal size poll ──
+                if _win_last_size is not None:
+                    _win_resize_counter += 1
+                    if _win_resize_counter >= _win_resize_check_interval:
+                        _win_resize_counter = 0
+                        try:
+                            _cur = shutil.get_terminal_size()
+                            if (_cur.columns != _win_last_size.columns
+                                    or _cur.lines != _win_last_size.lines):
+                                _win_last_size = _cur
+                                # Force invalidate so prompt_toolkit re-reads
+                                # terminal size on next render pass.
+                                self._app.invalidate()
+                                self._schedule_resize_redraw()
+                        except Exception:
+                            pass
                 if self._command_running:
                     self._invalidate(min_interval=0.1)
                     time.sleep(0.1)

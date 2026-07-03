@@ -751,6 +751,10 @@ For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/s
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
 Working directory: Use 'workdir' for per-command cwd.
+On Windows local sessions, keep project/workspace paths separate from Hermes config paths:
+- Project files usually live under the current working directory (for example `D:\\...\\project`).
+- Hermes config/state lives under HERMES_HOME such as `C:\\Users\\<user>\\.hermes\\...`.
+Do NOT assume the project lives under `~/.hermes/repos/...`, `/workspace/...`, `/testbed/...`, or `/mnt/c/...` unless a tool result explicitly shows that path.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
@@ -802,6 +806,31 @@ def clear_task_env_overrides(task_id: str):
     Called during cleanup to avoid stale entries accumulating.
     """
     _task_env_overrides.pop(task_id, None)
+
+
+def _resolve_container_task_id(task_id: Optional[str]) -> str:
+    """
+    Map a tool-call ``task_id`` to the container/sandbox key used by
+    ``_active_environments``.
+
+    The top-level agent passes ``task_id=None`` and lands on ``"default"``.
+    ``delegate_task`` children pass their own subagent ID so that
+    file-state tracking, the active-subagents registry, and TUI events stay
+    distinct per child -- but we deliberately collapse that ID back to
+    ``"default"`` here so subagents share the parent's long-lived container
+    (one bash, one /workspace, one set of installed packages).
+
+    Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
+    call ``register_task_env_overrides(task_id, {...})`` to request a
+    per-task Docker/Modal image. When an override is registered for a
+    task_id, we honour it by returning the task_id unchanged -- those
+    rollouts need their own isolated sandbox, which is the whole point of
+    the override.
+    """
+    if task_id and task_id in _task_env_overrides:
+        return task_id
+    return "default"
+
 
 # Configuration from environment variables
 
@@ -1139,8 +1168,9 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
+    lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(task_id)
+        return _active_environments.get(lookup) or _active_environments.get(task_id)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1314,6 +1344,21 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     return None
 
 
+def _summarize_failure_output(output: str, limit: int = 140) -> str:
+    """Extract a compact single-line summary from command output."""
+    if not output:
+        return ""
+
+    lines = [ln.strip() for ln in output.splitlines() if ln and ln.strip()]
+    if not lines:
+        return ""
+
+    summary = re.sub(r"\s+", " ", lines[-1]).strip()
+    if len(summary) > limit:
+        summary = summary[: limit - 3] + "..."
+    return summary
+
+
 def _command_requires_pipe_stdin(command: str) -> bool:
     """Return True when PTY mode would break stdin-driven commands.
 
@@ -1386,6 +1431,129 @@ def _foreground_background_guidance(command: str) -> str | None:
             )
 
     return None
+
+
+def _normalize_windows_paths_for_git_bash(command: str, env_type: str) -> str:
+    """Rewrite Windows drive paths so Git Bash does not treat ``\\`` as escapes.
+
+    Models often emit ``head D:\\repo\\AGENTS.md``. In MSYS bash, unquoted
+    backslashes are escape characters, so the path becomes corrupted. Converting
+    ``X:\\...`` to ``X:/...`` keeps semantics for POSIX tools (head, cat, grep).
+    """
+    if os.name != "nt" or env_type != "local":
+        return command
+
+    try:
+        from tools.environments.local import _get_shell_info
+
+        _, shell_type = _get_shell_info()
+    except Exception:
+        shell_type = "bash"
+
+    if shell_type != "bash":
+        return command
+
+    def _slashes(p: str) -> str:
+        return p.replace("\\", "/")
+
+    def _repl_dq(m: re.Match) -> str:
+        inner = m.group(1)
+        if len(inner) >= 3 and inner[1] == ":" and inner[0].isalpha() and inner[2] == "\\":
+            return '"' + _slashes(inner) + '"'
+        return m.group(0)
+
+    def _repl_sq(m: re.Match) -> str:
+        inner = m.group(1)
+        if len(inner) >= 3 and inner[1] == ":" and inner[0].isalpha() and inner[2] == "\\":
+            return "'" + _slashes(inner) + "'"
+        return m.group(0)
+
+    def _repl_bare(m: re.Match) -> str:
+        prefix, path = m.group(1), m.group(2)
+        return prefix + _slashes(path)
+
+    out = re.sub(r'"([^"]*)"', _repl_dq, command)
+    out = re.sub(r"'([^']*)'", _repl_sq, out)
+    out = re.sub(r"(^|[\s=])([A-Za-z]:\\[^\s|&;\"'<>]*)", _repl_bare, out)
+    return out
+
+
+def _normalize_windows_git_bash_exploration_command(command: str, env_type: str) -> str:
+    """Bound common Windows shell discovery probes to cheap listings.
+
+    On Windows with Git Bash: rewrites heavy recursive listings.
+    On Windows with cmd.exe: rewrites bash commands to cmd equivalents.
+    On Windows with PowerShell: most bash aliases work natively (ls, cat, pwd, etc.).
+    """
+    if os.name != "nt" or env_type != "local":
+        return command
+
+    # Determine active shell type (best-effort — fall back to treating as bash)
+    try:
+        from tools.environments.local import _get_shell_info
+        _, shell_type = _get_shell_info()
+    except Exception:
+        shell_type = "bash"
+
+    if shell_type == "cmd":
+        return _normalize_command_for_cmd(command)
+
+    # NOTE(Windows/Git Bash): ``dir /b`` is cmd syntax; here ``/b`` is read as path ``/b``.
+    command = re.sub(r"(?i)\bdir\s+/b\b", "ls -1", command)
+
+    # Git Bash path (existing behaviour)
+    normalized = " ".join(command.strip().lower().split())
+    if normalized in {"ls -la", "ls -al", "ls -lah", "ls -alh"}:
+        return "ls -1 | head -200"
+    if normalized in {"ls -r", "ls -r .", "ls -r ./", "ls -r /d", "ls -r /d/"}:
+        return "find . -maxdepth 3 -print | head -200"
+    return command
+
+
+def _normalize_command_for_cmd(command: str) -> str:
+    """Rewrite common bash commands to cmd.exe equivalents.
+
+    cmd.exe has no grep, head, ls, pwd, cat, etc.  This function rewrites
+    the most common exploration commands so the agent doesn't need to know
+    cmd syntax.
+    """
+    stripped = command.strip()
+    lower = stripped.lower()
+
+    # ls variants → dir
+    if lower in {"ls", "ls .", "ls ./"}:
+        return "dir /b"
+    if lower in {"ls -la", "ls -al", "ls -lah", "ls -alh", "ls -l"}:
+        return "dir"
+    if lower in {"ls -1", "ls -1 ."}:
+        return "dir /b"
+    if lower.startswith("ls "):
+        parts = stripped[3:].strip()
+        return f"dir {parts}"
+
+    # pwd → cd (prints current directory)
+    if lower in {"pwd", "pwd -P"}:
+        return "cd"
+
+    # cat → type
+    if lower.startswith("cat "):
+        return "type " + stripped[4:]
+
+    # Basic grep → findstr
+    if lower.startswith("grep "):
+        parts = stripped[5:].strip()
+        return f"findstr {parts}"
+
+    # head → nothing (cmd can't do this easily; just run the command)
+    if "| head" in lower or "|head" in lower:
+        # Drop the pipe head — cmd has no head
+        import re
+        return re.sub(r'\s*\|\s*head\s+-?\d*', '', command, flags=re.IGNORECASE)
+
+    # echo → echo (same in cmd)
+    # mkdir → mkdir or md (both work in cmd)
+
+    return command
 
 
 def _resolve_notification_flag_conflict(
@@ -1473,8 +1641,11 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # Use task_id for environment isolation
-        effective_task_id = task_id or "default"
+        # Use task_id for environment isolation. By default all subagent
+        # task_ids collapse back to "default" so the top-level agent and
+        # every delegate_task child share one container; only task_ids with
+        # a registered env override (RL benchmarks) get isolated sandboxes.
+        effective_task_id = _resolve_container_task_id(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config
@@ -1495,6 +1666,9 @@ def terminal_tool(
         cwd = overrides.get("cwd") or config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
+
+        command = _normalize_windows_paths_for_git_bash(command, env_type)
+        command = _normalize_windows_git_bash_exploration_command(command, env_type)
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -1822,7 +1996,7 @@ def terminal_tool(
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
-            
+
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
 
@@ -1878,6 +2052,10 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            if returncode != 0:
+                failure_summary = _summarize_failure_output(output)
+                if failure_summary:
+                    result_dict["failure_summary"] = failure_summary
             if approval_note:
                 result_dict["approval"] = approval_note
             if exit_note:

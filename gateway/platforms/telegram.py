@@ -715,22 +715,36 @@ class TelegramAdapter(BasePlatformAdapter):
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
             proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
-            if fallback_ips and not proxy_url and not disable_fallback:
+            if fallback_ips and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
                     self.name,
                     ", ".join(fallback_ips),
                 )
+                if proxy_url:
+                    logger.info(
+                        "[%s] Proxy detected; using fallback transport for Bot API calls and plain proxy for getUpdates: %s",
+                        self.name,
+                        proxy_url,
+                    )
                 # Keep request/update pools separate to reduce contention during
                 # polling reconnect + bot API bootstrap/delete_webhook calls.
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
                 )
-                get_updates_request = HTTPXRequest(
-                    **request_kwargs,
-                    httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
-                )
+                # Long polling is especially sensitive to overlapping/stuck
+                # upstream requests. Through an HTTP proxy, DNS resolution
+                # already happens remotely, so avoid combining getUpdates with
+                # the custom fallback transport — that combination has been
+                # observed to trigger self-conflicts on Telegram's side.
+                if proxy_url:
+                    get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
+                else:
+                    get_updates_request = HTTPXRequest(
+                        **request_kwargs,
+                        httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
+                    )
             elif proxy_url:
                 logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
                 request = HTTPXRequest(**request_kwargs, proxy=proxy_url)

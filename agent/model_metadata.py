@@ -515,7 +515,17 @@ def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any
         return _model_metadata_cache
 
     try:
-        response = requests.get(OPENROUTER_MODELS_URL, timeout=10, verify=_resolve_requests_verify())
+        verify = _resolve_requests_verify()
+        try:
+            response = requests.get(OPENROUTER_MODELS_URL, timeout=10, verify=verify)
+        except requests.exceptions.ProxyError:
+            # Some Windows proxy setups export HTTPS_PROXY that only supports
+            # plain HTTP tunneling; requests then raises ProxyError/SSL errors
+            # for OpenRouter metadata. Retry once with trust_env=False to bypass
+            # global proxy vars while leaving caller configuration intact.
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get(OPENROUTER_MODELS_URL, timeout=10, verify=verify)
         response.raise_for_status()
         data = response.json()
 

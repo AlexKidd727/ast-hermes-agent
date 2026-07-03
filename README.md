@@ -4,6 +4,19 @@
 
 # Hermes Agent ☤
 
+> **Форк с поддержкой Windows и Telegram proxy**
+>
+> Это доработанная версия [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) от [Студенников А.О.](https://ast-softpro.ru) ([ast-softpro.ru](https://ast-softpro.ru)).
+>
+> **Отличия форка:**
+> - нативная работа на **Windows 10/11** (без обязательного WSL2);
+> - исправлены пути и совместимость Windows-подсистем;
+> - **HTTP/HTTPS/SOCKS5 proxy для Telegram** через `TELEGRAM_PROXY` (см. `.env.example`);
+> - proxy для терминала и браузера на Windows;
+> - bat-лаунчеры: `hermes_cli.bat`, `start_agent.bat`, `start_gateway.bat`.
+>
+> Секреты и локальное состояние (`~/.hermes`, `.env`) в репозиторий не попадают — используйте `.env.example` и `cli-config.yaml.example`.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
   <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
@@ -37,7 +50,19 @@ Works on Linux, macOS, WSL2, and Android via Termux. The installer handles the p
 
 > **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
 >
-> **Windows:** Native Windows is not supported. Please install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the command above.
+> **Windows (этот форк):** установите Python 3.11+, создайте venv, скопируйте `.env.example` в `.env`, затем:
+>
+> ```powershell
+> python -m venv .venv
+> .\.venv\Scripts\Activate.ps1
+> pip install -e ".[all,dev]"
+> copy .env.example .env
+> copy cli-config.yaml.example cli-config.yaml
+> .\hermes_cli.bat setup
+> .\start_agent.bat
+> ```
+>
+> **Telegram через proxy:** добавьте в `.env` переменную `TELEGRAM_PROXY` (пример в `.env.example`), затем `.\start_gateway.bat` или `hermes_cli.bat gateway run`.
 
 After installation:
 
