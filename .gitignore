@@ -80,6 +80,5 @@ website/static/api/skills-index.json
 cursor/
 
 # Local scripts
-*.bat
 start_agent.sh
 start_gateway.sh
