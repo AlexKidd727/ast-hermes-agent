@@ -13,7 +13,7 @@
 > - исправлены пути и совместимость Windows-подсистем;
 > - **HTTP/HTTPS/SOCKS5 proxy для Telegram** через `TELEGRAM_PROXY` (см. `.env.example`);
 > - proxy для терминала и браузера на Windows;
-> - bat-лаунчеры: `hermes_cli.bat`, `start_agent.bat`, `start_gateway.bat`.
+> - bat-лаунчеры: `hermes_cli.bat`, `start_gateway.bat`.
 >
 > Секреты и локальное состояние (`~/.hermes`, `.env`) в репозиторий не попадают — используйте `.env.example` и `cli-config.yaml.example`.
 
@@ -59,7 +59,7 @@ Works on Linux, macOS, WSL2, and Android via Termux. The installer handles the p
 > copy .env.example .env
 > copy cli-config.yaml.example cli-config.yaml
 > .\hermes_cli.bat setup
-> .\start_agent.bat
+> .\hermes_cli.bat
 > ```
 >
 > **Telegram через proxy:** добавьте в `.env` переменную `TELEGRAM_PROXY` (пример в `.env.example`), затем `.\start_gateway.bat` или `hermes_cli.bat gateway run`.
